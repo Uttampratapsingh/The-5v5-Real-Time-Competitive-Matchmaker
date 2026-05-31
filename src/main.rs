@@ -1,13 +1,14 @@
 use std::{
-    collections::{BTreeMap, HashMap},
     collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
+    env,
     hash::{Hash, Hasher},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -18,15 +19,94 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const N_SHARDS: usize = 8;
 const BRACKET_SIZE: f64 = 200.0;
-const BASE_WINDOW: f64 = 150.0;
-const WINDOW_EXPAND_PER_SEC: f64 = 50.0;
-const MAX_WINDOW: f64 = 600.0;
-const CROSS_REGION_WAIT_SECS: u64 = 15;
-const WORKER_IDLE_MS: u64 = 5;
+const DEFAULT_BASE_WINDOW: f64 = 150.0;
+const DEFAULT_WINDOW_EXPAND_PER_SEC: f64 = 50.0;
+const DEFAULT_MAX_WINDOW: f64 = 600.0;
+const DEFAULT_CROSS_REGION_WAIT_SECS: u64 = 15;
+const DEFAULT_WORKER_IDLE_MS: u64 = 5;
+const DEFAULT_API_WORKER_MULTIPLIER: usize = 4;
+const DEFAULT_API_QUEUE_LIMIT: usize = 4096;
 const METRICS_PORT: u16 = 9090;
 const API_PORT: u16 = 8080;
 const AVG_WAIT_SAMPLES: usize = 100;
 const MAX_RATING: f64 = 3000.0;
+
+struct Config {
+    base_window: f64,
+    window_expand_per_sec: f64,
+    max_window: f64,
+    cross_region_wait_secs: u64,
+    worker_idle_ms: u64,
+    api_worker_count: usize,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        let cpu_count = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4);
+        let default_api_workers = cpu_count.saturating_mul(DEFAULT_API_WORKER_MULTIPLIER);
+        let mut config = Self {
+            base_window: DEFAULT_BASE_WINDOW,
+            window_expand_per_sec: DEFAULT_WINDOW_EXPAND_PER_SEC,
+            max_window: DEFAULT_MAX_WINDOW,
+            cross_region_wait_secs: DEFAULT_CROSS_REGION_WAIT_SECS,
+            worker_idle_ms: DEFAULT_WORKER_IDLE_MS,
+            api_worker_count: default_api_workers,
+        };
+
+        if env_bool("MATCHMAKER_FAST_CROSS_REGION") || env_bool("MATCHMAKER_FAST") {
+            config.cross_region_wait_secs = 0;
+        }
+
+        config.base_window = env_f64("MATCHMAKER_BASE_WINDOW", config.base_window);
+        config.window_expand_per_sec = env_f64(
+            "MATCHMAKER_WINDOW_EXPAND_PER_SEC",
+            config.window_expand_per_sec,
+        );
+        config.max_window = env_f64("MATCHMAKER_MAX_WINDOW", config.max_window)
+            .max(config.base_window);
+        config.cross_region_wait_secs =
+            env_u64("MATCHMAKER_CROSS_REGION_WAIT_SECS", config.cross_region_wait_secs);
+        if env_bool("MATCHMAKER_FAST_CROSS_REGION") {
+            config.cross_region_wait_secs = 0;
+        }
+        config.worker_idle_ms = env_u64("MATCHMAKER_WORKER_IDLE_MS", config.worker_idle_ms);
+        config.api_worker_count =
+            env_usize("MATCHMAKER_API_WORKERS", config.api_worker_count).max(1);
+
+        config
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
 
 #[derive(Clone)]
 struct Player {
@@ -82,6 +162,65 @@ struct Candidate {
     shard_idx: usize,
     join_timestamp: Instant,
     id: u64,
+}
+
+#[derive(Clone)]
+struct OldestEntry {
+    join_timestamp: Instant,
+    id: u64,
+    rating: f64,
+    region: String,
+    entry: Arc<PlayerEntry>,
+}
+
+impl PartialEq for OldestEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.join_timestamp == other.join_timestamp && self.id == other.id
+    }
+}
+
+impl Eq for OldestEntry {}
+
+impl PartialOrd for OldestEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OldestEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.join_timestamp
+            .cmp(&other.join_timestamp)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+struct CandidateKey {
+    join_timestamp: Instant,
+    id: u64,
+    candidate: Candidate,
+}
+
+impl PartialEq for CandidateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.join_timestamp == other.join_timestamp && self.id == other.id
+    }
+}
+
+impl Eq for CandidateKey {}
+
+impl PartialOrd for CandidateKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CandidateKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.join_timestamp
+            .cmp(&other.join_timestamp)
+            .then_with(|| self.id.cmp(&other.id))
+    }
 }
 
 struct MatchResult {
@@ -205,17 +344,62 @@ struct Pivot {
     region: String,
     median_rating: f64,
     oldest_wait_secs: f64,
-    allow_cross_region: bool,
+}
+
+struct ApiRequestQueue {
+    queue: Mutex<VecDeque<Request>>,
+    cv: Condvar,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ApiRequestQueue {
+    fn new(shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown,
+        }
+    }
+
+    fn push(&self, request: Request) -> Result<(), Box<Request>> {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.len() >= DEFAULT_API_QUEUE_LIMIT {
+            return Err(Box::new(request));
+        }
+        queue.push_back(request);
+        self.cv.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Request> {
+        let mut queue = self.queue.lock().unwrap();
+        loop {
+            if let Some(request) = queue.pop_front() {
+                return Some(request);
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
+            queue = self.cv.wait(queue).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.cv.notify_all();
+    }
 }
 
 struct Matchmaker {
     shards: Vec<Mutex<Shard>>,
     index: Mutex<HashMap<u64, PlayerLocator>>,
+    regions: Mutex<HashSet<String>>,
+    oldest_heap: Mutex<BinaryHeap<std::cmp::Reverse<OldestEntry>>>,
     metrics: Arc<Metrics>,
+    config: Arc<Config>,
 }
 
 impl Matchmaker {
-    fn new(metrics: Arc<Metrics>) -> Self {
+    fn new(metrics: Arc<Metrics>, config: Arc<Config>) -> Self {
         let mut shards = Vec::with_capacity(N_SHARDS);
         for _ in 0..N_SHARDS {
             shards.push(Mutex::new(Shard {
@@ -225,7 +409,10 @@ impl Matchmaker {
         Self {
             shards,
             index: Mutex::new(HashMap::new()),
+            regions: Mutex::new(HashSet::new()),
+            oldest_heap: Mutex::new(BinaryHeap::new()),
             metrics,
+            config,
         }
     }
 
@@ -262,6 +449,22 @@ impl Matchmaker {
         let mut shard = self.shards[shard_idx].lock().unwrap();
         let bucket = shard.buckets.entry(bucket_key.clone()).or_default();
         bucket.entry(rating_key).or_default().push(entry.clone());
+
+        self.oldest_heap
+            .lock()
+            .unwrap()
+            .push(std::cmp::Reverse(OldestEntry {
+                join_timestamp: entry.player.join_timestamp,
+                id: entry.player.id,
+                rating: entry.player.skill_rating,
+                region: entry.player.ping_region.clone(),
+                entry: entry.clone(),
+            }));
+
+        self.regions
+            .lock()
+            .unwrap()
+            .insert(req.ping_region.clone());
 
         let position = (self
             .metrics
@@ -308,19 +511,45 @@ impl Matchmaker {
         self.metrics.snapshot()
     }
 
+    fn regions_snapshot(&self) -> Vec<String> {
+        self.regions
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn oldest_entry_snapshot(&self) -> Option<OldestEntry> {
+        let mut heap = self.oldest_heap.lock().unwrap();
+        loop {
+            let top = heap.peek()?;
+            if top.0.entry.evicted.load(Ordering::Acquire) {
+                heap.pop();
+                continue;
+            }
+            return Some(top.0.clone());
+        }
+    }
+
     fn try_form_match(&self, log_tx: &Sender<MatchLog>) -> bool {
+        if self.metrics.queue_depth.load(Ordering::Relaxed) < 10 {
+            return false;
+        }
         let now = Instant::now();
         let Some(pivot) = self.find_pivot(now) else {
             return false;
         };
 
-        let mut candidates = self.collect_candidates(&pivot, BASE_WINDOW);
-        if candidates.len() < 10 {
-            let expanded =
-                (BASE_WINDOW + WINDOW_EXPAND_PER_SEC * pivot.oldest_wait_secs).min(MAX_WINDOW);
-            if expanded > BASE_WINDOW {
-                candidates = self.collect_candidates(&pivot, expanded);
-            }
+        let allow_cross_region =
+            pivot.oldest_wait_secs >= self.config.cross_region_wait_secs as f64;
+        let base_window = self.config.base_window;
+        let expanded = (base_window
+            + self.config.window_expand_per_sec * pivot.oldest_wait_secs)
+            .min(self.config.max_window);
+        let mut candidates = self.collect_candidates(&pivot, base_window, allow_cross_region);
+        if candidates.len() < 10 && expanded > base_window {
+            candidates = self.collect_candidates(&pivot, expanded, allow_cross_region);
         }
 
         if candidates.len() < 10 {
@@ -331,37 +560,23 @@ impl Matchmaker {
     }
 
     fn find_pivot(&self, now: Instant) -> Option<Pivot> {
-        let mut oldest_wait = Duration::from_secs(0);
-        let mut oldest_bucket: Option<BucketKey> = None;
-
-        for shard in &self.shards {
-            let shard = shard.lock().unwrap();
-            for (bucket_key, tree) in &shard.buckets {
-                for vec in tree.values() {
-                    for entry in vec {
-                        if entry.evicted.load(Ordering::Acquire) {
-                            continue;
-                        }
-                        let wait = now.duration_since(entry.player.join_timestamp);
-                        if wait > oldest_wait {
-                            oldest_wait = wait;
-                            oldest_bucket = Some(bucket_key.clone());
-                        }
-                    }
-                }
-            }
+        let oldest = self.oldest_entry_snapshot()?;
+        if oldest.entry.evicted.load(Ordering::Acquire) {
+            return None;
         }
 
-        let bucket = oldest_bucket?;
+        let bracket = rating_to_bracket(oldest.rating);
+        let bucket = BucketKey {
+            bracket,
+            region: oldest.region.clone(),
+        };
         let median_rating = self.bucket_median_rating(&bucket)?;
-        let oldest_wait_secs = oldest_wait.as_secs_f64();
-        let allow_cross_region = oldest_wait.as_secs() >= CROSS_REGION_WAIT_SECS;
+        let oldest_wait_secs = now.duration_since(oldest.join_timestamp).as_secs_f64();
 
         Some(Pivot {
-            region: bucket.region,
+            region: oldest.region,
             median_rating,
             oldest_wait_secs,
-            allow_cross_region,
         })
     }
 
@@ -384,49 +599,85 @@ impl Matchmaker {
         None
     }
 
-    fn collect_candidates(&self, pivot: &Pivot, window: f64) -> Vec<Candidate> {
+    fn collect_candidates(
+        &self,
+        pivot: &Pivot,
+        window: f64,
+        allow_cross_region: bool,
+    ) -> Vec<Candidate> {
         let min_rating = (pivot.median_rating - window).max(0.0);
         let max_rating = (pivot.median_rating + window).min(MAX_RATING);
         let min_bracket = rating_to_bracket(min_rating);
         let max_bracket = rating_to_bracket(max_rating);
 
-        let mut candidates = Vec::new();
+        let mut candidates = BinaryHeap::with_capacity(10);
 
-        for (shard_idx, shard_mutex) in self.shards.iter().enumerate() {
-            let shard = shard_mutex.lock().unwrap();
-            for (bucket_key, tree) in &shard.buckets {
-                if bucket_key.bracket < min_bracket || bucket_key.bracket > max_bracket {
-                    continue;
-                }
-                if !pivot.allow_cross_region && bucket_key.region != pivot.region {
-                    continue;
-                }
+        let regions = if allow_cross_region {
+            let snapshot = self.regions_snapshot();
+            if snapshot.is_empty() {
+                vec![pivot.region.clone()]
+            } else {
+                snapshot
+            }
+        } else {
+            vec![pivot.region.clone()]
+        };
 
+        let mut buckets_by_shard: HashMap<usize, Vec<BucketKey>> = HashMap::new();
+        for region in regions {
+            for bracket in min_bracket..=max_bracket {
+                let bucket_key = BucketKey {
+                    bracket,
+                    region: region.clone(),
+                };
+                let shard_idx = shard_index(bracket, &region);
+                buckets_by_shard
+                    .entry(shard_idx)
+                    .or_default()
+                    .push(bucket_key);
+            }
+        }
+
+        for (shard_idx, bucket_keys) in buckets_by_shard {
+            let shard = self.shards[shard_idx].lock().unwrap();
+            for bucket_key in bucket_keys {
+                let Some(tree) = shard.buckets.get(&bucket_key) else {
+                    continue;
+                };
                 for (rating_key, vec) in tree.range(OrdF64(min_rating)..=OrdF64(max_rating)) {
                     for entry in vec {
                         if entry.evicted.load(Ordering::Acquire) {
                             continue;
                         }
                         let player = &entry.player;
-                        candidates.push(Candidate {
+                        let candidate = Candidate {
                             entry: entry.clone(),
                             bucket_key: bucket_key.clone(),
                             rating_key: *rating_key,
                             shard_idx,
                             join_timestamp: player.join_timestamp,
                             id: player.id,
+                        };
+                        candidates.push(CandidateKey {
+                            join_timestamp: candidate.join_timestamp,
+                            id: candidate.id,
+                            candidate,
                         });
+                        if candidates.len() > 10 {
+                            let _ = candidates.pop();
+                        }
                     }
                 }
             }
         }
 
-        candidates.sort_by(|a, b| {
+        let mut trimmed: Vec<Candidate> = candidates.into_iter().map(|key| key.candidate).collect();
+        trimmed.sort_by(|a, b| {
             a.join_timestamp
                 .cmp(&b.join_timestamp)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        candidates
+        trimmed
     }
 
     fn evict_candidates(
@@ -506,7 +757,7 @@ impl Matchmaker {
         }
 
         let mut players: Vec<Player> = selected.iter().map(|c| c.entry.player.clone()).collect();
-        let match_result = compute_match_result(&mut players);
+        let match_result = compute_match_result(&mut players, self.config.max_window);
         let matched_ids = selected.iter().map(|c| c.id).collect();
         let regions = selected
             .iter()
@@ -561,14 +812,20 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     let metrics = Arc::new(Metrics::new());
-    let matchmaker = Arc::new(Matchmaker::new(metrics.clone()));
+    let config = Arc::new(Config::from_env());
+    let matchmaker = Arc::new(Matchmaker::new(metrics.clone(), config.clone()));
 
     let (log_tx, log_rx) = mpsc::channel::<MatchLog>();
     spawn_logger(log_rx, shutdown.clone());
     spawn_metrics_server(metrics, shutdown.clone());
-    spawn_workers(matchmaker.clone(), log_tx.clone(), shutdown.clone());
+    spawn_workers(
+        matchmaker.clone(),
+        log_tx.clone(),
+        shutdown.clone(),
+        config.clone(),
+    );
 
-    run_api_server(matchmaker, shutdown)?;
+    run_api_server(matchmaker, shutdown, config)?;
     Ok(())
 }
 
@@ -576,6 +833,7 @@ fn spawn_workers(
     matchmaker: Arc<Matchmaker>,
     log_tx: Sender<MatchLog>,
     shutdown: Arc<AtomicBool>,
+    config: Arc<Config>,
 ) {
     let worker_count = thread::available_parallelism()
         .map(|count| count.get())
@@ -585,15 +843,26 @@ fn spawn_workers(
         let mm = matchmaker.clone();
         let tx = log_tx.clone();
         let sd = shutdown.clone();
-        thread::spawn(move || worker_loop(mm, tx, sd));
+        let cfg = config.clone();
+        thread::spawn(move || worker_loop(mm, tx, sd, cfg));
     }
 }
 
-fn worker_loop(matchmaker: Arc<Matchmaker>, log_tx: Sender<MatchLog>, shutdown: Arc<AtomicBool>) {
+fn worker_loop(
+    matchmaker: Arc<Matchmaker>,
+    log_tx: Sender<MatchLog>,
+    shutdown: Arc<AtomicBool>,
+    config: Arc<Config>,
+) {
     while !shutdown.load(Ordering::Relaxed) {
         let formed = matchmaker.try_form_match(&log_tx);
         if !formed {
-            thread::sleep(Duration::from_millis(WORKER_IDLE_MS));
+            let idle_ms = config.worker_idle_ms;
+            if idle_ms == 0 {
+                thread::yield_now();
+            } else {
+                thread::sleep(Duration::from_millis(idle_ms));
+            }
         }
     }
 }
@@ -622,20 +891,51 @@ fn spawn_logger(rx: Receiver<MatchLog>, shutdown: Arc<AtomicBool>) {
 fn run_api_server(
     matchmaker: Arc<Matchmaker>,
     shutdown: Arc<AtomicBool>,
+    config: Arc<Config>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = Server::http(("0.0.0.0", API_PORT))?;
+    let request_queue = Arc::new(ApiRequestQueue::new(shutdown.clone()));
+    spawn_api_workers(matchmaker.clone(), request_queue.clone(), shutdown.clone(), config);
     while !shutdown.load(Ordering::Relaxed) {
         match server.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(request)) => {
-                if let Err(err) = handle_request(request, &matchmaker) {
-                    eprintln!("request error: {err}");
+                if let Err(request) = request_queue.push(request) {
+                    let request = *request;
+                    let _ = respond_error(request, StatusCode(503), "server busy");
                 }
             }
             Ok(None) => continue,
             Err(err) => eprintln!("api server error: {err}"),
         }
     }
+    request_queue.close();
     Ok(())
+}
+
+fn spawn_api_workers(
+    matchmaker: Arc<Matchmaker>,
+    request_queue: Arc<ApiRequestQueue>,
+    shutdown: Arc<AtomicBool>,
+    config: Arc<Config>,
+) {
+    for _ in 0..config.api_worker_count {
+        let mm = matchmaker.clone();
+        let queue = request_queue.clone();
+        let sd = shutdown.clone();
+        thread::spawn(move || loop {
+            if sd.load(Ordering::Relaxed) {
+                break;
+            }
+            match queue.pop() {
+                Some(request) => {
+                    if let Err(err) = handle_request(request, &mm) {
+                        eprintln!("request error: {err}");
+                    }
+                }
+                None => break,
+            }
+        });
+    }
 }
 
 fn handle_request(mut request: Request, matchmaker: &Matchmaker) -> std::io::Result<()> {
@@ -805,7 +1105,7 @@ fn remove_locator(shard: &mut Shard, locator: &PlayerLocator) -> bool {
     removed
 }
 
-fn compute_match_result(players: &mut [Player]) -> MatchResult {
+fn compute_match_result(players: &mut [Player], max_window: f64) -> MatchResult {
     players.sort_by(|a, b| a.skill_rating.total_cmp(&b.skill_rating));
 
     let team_a_indices = [0usize, 3, 5, 7, 9];
@@ -824,7 +1124,8 @@ fn compute_match_result(players: &mut [Player]) -> MatchResult {
     let team_a_avg_sr = team_a_sum / 5.0;
     let team_b_avg_sr = team_b_sum / 5.0;
     let sr_delta = (team_a_avg_sr - team_b_avg_sr).abs();
-    let match_quality_score = (1.0 - (sr_delta / (MAX_WINDOW * 2.0))).clamp(0.0, 1.0);
+    let denom = (max_window * 2.0).max(1.0);
+    let match_quality_score = (1.0 - (sr_delta / denom)).clamp(0.0, 1.0);
 
     MatchResult {
         team_a_avg_sr,

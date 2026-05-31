@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import argparse
 import concurrent.futures
 import json
 import math
+import os
 import random
 import subprocess
 import threading
@@ -13,8 +15,10 @@ import requests
 API_URL = "http://127.0.0.1:8080"
 METRICS_URL = f"{API_URL}/metrics"
 REGIONS = ["us-east", "us-west", "eu-west", "eu-central", "ap-east"]
+BENCHMARK_REGION_WEIGHTS = [0.55, 0.2, 0.15, 0.05, 0.05]
 TOTAL_PLAYERS = 500
 MAX_ENQUEUE_RETRIES = 5
+METRICS_POLL_INTERVAL = 0.5
 
 enqueue_times = {}
 match_times = {}
@@ -53,10 +57,16 @@ def wait_for_server(timeout_s=15):
     raise RuntimeError("server did not start in time")
 
 
-def enqueue_player(pid):
+def pick_region(profile):
+    if profile == "benchmark":
+        return random.choices(REGIONS, weights=BENCHMARK_REGION_WEIGHTS, k=1)[0]
+    return random.choice(REGIONS)
+
+
+def enqueue_player(pid, profile):
     rating = random.gauss(1500, 300)
     rating = max(0.0, min(3000.0, rating))
-    region = random.choice(REGIONS)
+    region = pick_region(profile)
     payload = {"id": pid, "skill_rating": rating, "ping_region": region}
     start = time.time()
     for attempt in range(MAX_ENQUEUE_RETRIES):
@@ -84,10 +94,30 @@ def percentile(values, pct):
     return values[f] + (values[c] - values[f]) * (k - f)
 
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description="Matchmaker load simulation")
+    parser.add_argument(
+        "--profile",
+        choices=["spec", "benchmark"],
+        default="spec",
+        help="Region distribution profile (default: spec)",
+    )
+    parser.add_argument(
+        "--fast-cross-region",
+        action="store_true",
+        help="Enable immediate cross-region matching in the server",
+    )
+    return parser.parse_args()
+
+
+def main(args):
     binary = Path("target/release/matchmaker")
     if not binary.exists():
         raise RuntimeError("binary not found; run cargo build --release first")
+
+    env = dict(os.environ)
+    if args.fast_cross_region:
+        env["MATCHMAKER_FAST_CROSS_REGION"] = "1"
 
     proc = subprocess.Popen(
         [str(binary)],
@@ -95,6 +125,7 @@ def main():
         stderr=subprocess.DEVNULL,
         text=True,
         bufsize=1,
+        env=env,
     )
 
     log_thread = threading.Thread(target=read_match_logs, args=(proc,), daemon=True)
@@ -104,7 +135,10 @@ def main():
     start_time = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_PLAYERS) as executor:
-        futures = [executor.submit(enqueue_player, pid) for pid in range(1, TOTAL_PLAYERS + 1)]
+        futures = [
+            executor.submit(enqueue_player, pid, args.profile)
+            for pid in range(1, TOTAL_PLAYERS + 1)
+        ]
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
@@ -115,13 +149,13 @@ def main():
             resp.raise_for_status()
             metrics = resp.json()
         except requests.RequestException:
-            time.sleep(0.5)
+            time.sleep(METRICS_POLL_INTERVAL)
             continue
         if metrics.get("total_players_queued", 0) >= TOTAL_PLAYERS and metrics.get(
             "queue_depth", 1
         ) == 0:
             break
-        time.sleep(0.5)
+        time.sleep(METRICS_POLL_INTERVAL)
 
     deadline = time.time() + 10
     while True:
@@ -169,4 +203,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())
