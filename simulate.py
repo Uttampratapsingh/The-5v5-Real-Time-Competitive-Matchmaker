@@ -16,7 +16,7 @@ API_URL = "http://127.0.0.1:8080"
 METRICS_URL = f"{API_URL}/metrics"
 REGIONS = ["us-east", "us-west", "eu-west", "eu-central", "ap-east"]
 BENCHMARK_REGION_WEIGHTS = [0.55, 0.2, 0.15, 0.05, 0.05]
-TOTAL_PLAYERS = 500
+DEFAULT_PLAYERS = 500
 MAX_ENQUEUE_RETRIES = 5
 METRICS_POLL_INTERVAL = 0.5
 
@@ -107,6 +107,24 @@ def parse_args():
         action="store_true",
         help="Enable immediate cross-region matching in the server",
     )
+    parser.add_argument(
+        "--players",
+        type=int,
+        default=DEFAULT_PLAYERS,
+        help="Total players to enqueue (default: 500)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Max concurrent enqueue workers (default: players)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for reproducible runs",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +136,15 @@ def main(args):
     env = dict(os.environ)
     if args.fast_cross_region:
         env["MATCHMAKER_FAST_CROSS_REGION"] = "1"
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    total_players = max(1, args.players)
+    max_workers = args.concurrency or total_players
+    if max_workers < 1:
+        max_workers = total_players
+    max_workers = min(max_workers, total_players)
 
     proc = subprocess.Popen(
         [str(binary)],
@@ -134,10 +161,10 @@ def main(args):
     wait_for_server()
     start_time = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=TOTAL_PLAYERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(enqueue_player, pid, args.profile)
-            for pid in range(1, TOTAL_PLAYERS + 1)
+            for pid in range(1, total_players + 1)
         ]
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -151,7 +178,7 @@ def main(args):
         except requests.RequestException:
             time.sleep(METRICS_POLL_INTERVAL)
             continue
-        if metrics.get("total_players_queued", 0) >= TOTAL_PLAYERS and metrics.get(
+        if metrics.get("total_players_queued", 0) >= total_players and metrics.get(
             "queue_depth", 1
         ) == 0:
             break
@@ -160,7 +187,7 @@ def main(args):
     deadline = time.time() + 10
     while True:
         with lock:
-            done = len(match_times) >= TOTAL_PLAYERS
+            done = len(match_times) >= total_players
         if done or time.time() > deadline:
             break
         time.sleep(0.1)
@@ -187,6 +214,9 @@ def main(args):
     p99 = percentile(waits_ms, 99)
 
     print("Final report")
+    print(f"Players queued: {total_players}")
+    print(f"Concurrency: {max_workers}")
+    print(f"Profile: {args.profile}")
     print(f"Total time elapsed: {elapsed:.2f} s")
     print(f"Matches formed: {matches}")
     print(f"Average wait time (ms): {avg_wait_ms:.0f}")

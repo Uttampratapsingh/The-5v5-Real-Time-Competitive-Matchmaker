@@ -46,7 +46,7 @@ Beyond a single process, the same design can be lifted to a distributed system b
   ./target/release/matchmaker &
   python3 simulate.py
 ```
-Optional: `python3 simulate.py --profile benchmark` uses skewed regions; `python3 simulate.py --fast-cross-region` enables immediate cross-region (non-spec).
+Optional: `python3 simulate.py --profile benchmark` skews regions; `--fast-cross-region` enables immediate cross-region (non-spec); use `--players`/`--concurrency` for bigger loads.
 Optional modes:
 - Fast cross-region: `MATCHMAKER_FAST_CROSS_REGION=1 ./target/release/matchmaker`
 - Benchmark distribution: `python3 simulate.py --profile benchmark`
